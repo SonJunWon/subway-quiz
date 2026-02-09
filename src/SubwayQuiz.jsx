@@ -211,7 +211,7 @@ function getTransferLines(station, currentLine) {
 const initialState = {
   phase: 'title',
   // Title
-  nickname: '익명의 승객',
+  nickname: loadFromStorage('subway-quiz-nickname', '익명의 승객'),
   startDifficulty: 1,
   // Game progress
   difficultyLevel: 1,
@@ -263,6 +263,7 @@ function reducer(state, action) {
   switch (action.type) {
     // ===== TITLE & GAME MANAGEMENT =====
     case 'SET_NICKNAME':
+      saveToStorage('subway-quiz-nickname', action.value);
       return { ...state, nickname: action.value };
     case 'SET_START_DIFFICULTY':
       return { ...state, startDifficulty: action.value };
@@ -281,7 +282,7 @@ function reducer(state, action) {
     case 'SET_RECORD_IDX':
       return { ...state, currentRecordIdx: action.idx };
     case 'BACK_TO_TITLE':
-      return { ...initialState };
+      return { ...initialState, nickname: state.nickname, startDifficulty: state.startDifficulty };
     case 'SHOW_LEADERBOARD':
       return { ...state, phase: 'leaderboard', returnTo: action.from || 'title' };
     case 'SHOW_STATS':
@@ -349,7 +350,7 @@ function reducer(state, action) {
     case 'SET_INPUT':
       return { ...state, userInput: action.value };
     case 'TIMER_TICK':
-      if (state.phase !== 'input' && state.transferPhase !== 'select') return state;
+      if (state.phase !== 'input' && state.transferPhase !== 'select' && !(state.showMC && !state.mcResult)) return state;
       return { ...state, timeLeft: Math.max(0, +(state.timeLeft - 0.1).toFixed(1)) };
 
     case 'SUBMIT_ANSWER': {
@@ -393,8 +394,10 @@ function reducer(state, action) {
         totalQuestionsPlayed: state.totalQuestionsPlayed + 1,
       };
     }
-    case 'SHOW_MC':
-      return { ...state, showMC: true };
+    case 'SHOW_MC': {
+      const diff = DIFFICULTY_LEVELS[state.difficultyLevel - 1];
+      return { ...state, showMC: true, timeLeft: diff.inputTime / 2 };
+    }
     case 'MC_SELECT': {
       if (state.mcResult) return state;
       const { option } = action;
@@ -403,6 +406,10 @@ function reducer(state, action) {
         ...state, mcResult: ok ? 'correct' : 'wrong',
         mcSelectedOption: option, score: ok ? state.score + 30 : state.score,
       };
+    }
+    case 'MC_TIMEOUT': {
+      if (!state.showMC || state.mcResult) return state;
+      return { ...state, mcResult: 'wrong', mcSelectedOption: null };
     }
 
     // ===== TRANSFER =====
@@ -492,8 +499,10 @@ export default function SubwayQuiz() {
   const [muted, setMuted] = useState(false);
   const [showEndConfirm, setShowEndConfirm] = useState(false);
   const [displayScore, setDisplayScore] = useState(0);
-  const [leaderboard, setLeaderboard] = useState(() => loadFromStorage('leaderboard', []));
-  const [lineStats, setLineStats] = useState(() => loadFromStorage('lineStats', makeEmptyLineStats()));
+  const [leaderboard, setLeaderboard] = useState(() => loadFromStorage('subway-quiz-leaderboard', []));
+  const [lineStats, setLineStats] = useState(() => loadFromStorage('subway-quiz-stats', makeEmptyLineStats()));
+  const [bestRecord, setBestRecord] = useState(() => loadFromStorage('subway-quiz-best', { bestScore: 0, bestCombo: 0, bestLevel: 0 }));
+  const [isNewRecord, setIsNewRecord] = useState(false);
   const mutedRef = useRef(false);
   const toneReady = useRef(false);
   const synthsRef = useRef({});
@@ -787,7 +796,7 @@ export default function SubwayQuiz() {
 
   // Timer warning sounds (5s countdown)
   useEffect(() => {
-    if (phase !== 'input' && transferPhase !== 'select') {
+    if (phase !== 'input' && transferPhase !== 'select' && !(showMC && !mcResult)) {
       lastTickSecond.current = 20;
       return;
     }
@@ -796,7 +805,7 @@ export default function SubwayQuiz() {
       lastTickSecond.current = sec;
       playTimerWarn(sec);
     }
-  }, [phase, transferPhase, timeLeft, playTimerWarn]);
+  }, [phase, transferPhase, timeLeft, playTimerWarn, showMC, mcResult]);
 
   // Auto-focus input
   useEffect(() => {
@@ -826,15 +835,30 @@ export default function SubwayQuiz() {
     }
   }, [phase, resultType, showMC, transferPhase]);
 
+  // MC timer
+  useEffect(() => {
+    if (!showMC || mcResult) return;
+    const id = setInterval(() => dispatch({ type: 'TIMER_TICK' }), 100);
+    return () => clearInterval(id);
+  }, [showMC, mcResult]);
+
+  // MC timeout check
+  useEffect(() => {
+    if (showMC && !mcResult && timeLeft <= 0.05) {
+      playTimeout();
+      dispatch({ type: 'MC_TIMEOUT' });
+    }
+  }, [showMC, mcResult, timeLeft, playTimeout]);
+
   // MC result → next question
   useEffect(() => {
     if (!mcResult) return;
     if (mcResult === 'correct') playCorrect();
-    if (mcResult === 'wrong') playWrong();
+    if (mcResult === 'wrong' && mcSelectedOption !== null) playWrong();
     const delay = mcResult === 'correct' ? 1500 : 2000;
     const id = setTimeout(() => dispatch({ type: 'NEXT_QUESTION' }), delay);
     return () => clearTimeout(id);
-  }, [mcResult, playCorrect, playWrong]);
+  }, [mcResult, mcSelectedOption, playCorrect, playWrong]);
 
   // Transfer button timer
   useEffect(() => {
@@ -882,7 +906,7 @@ export default function SubwayQuiz() {
     return () => clearTimeout(id);
   }, [phase, levelChangeMsg, playLevelUp, playLevelDown]);
 
-  // Save leaderboard on game complete
+  // Save leaderboard + best record on game complete
   useEffect(() => {
     if (phase !== 'gameComplete') return;
     const record = {
@@ -890,13 +914,25 @@ export default function SubwayQuiz() {
       score,
       accuracy: totalQuestionsPlayed ? Math.round(totalCorrect / totalQuestionsPlayed * 100) : 0,
       level: difficultyLevel,
+      maxCombo,
       date: new Date().toLocaleDateString('ko-KR'),
     };
     setLeaderboard(prev => {
       const updated = [...prev, record].sort((a, b) => b.score - a.score).slice(0, 10);
       const idx = updated.findIndex(r => r === record);
-      saveToStorage('leaderboard', updated);
+      saveToStorage('subway-quiz-leaderboard', updated);
       dispatch({ type: 'SET_RECORD_IDX', idx });
+      return updated;
+    });
+    // Update best record
+    setBestRecord(prev => {
+      const updated = {
+        bestScore: Math.max(prev.bestScore, score),
+        bestCombo: Math.max(prev.bestCombo, maxCombo),
+        bestLevel: Math.max(prev.bestLevel, difficultyLevel),
+      };
+      saveToStorage('subway-quiz-best', updated);
+      setIsNewRecord(score > prev.bestScore);
       return updated;
     });
   }, [phase]);
@@ -921,7 +957,7 @@ export default function SubwayQuiz() {
             freeCorrect: resultType === 'correct' ? line.freeCorrect + 1 : line.freeCorrect,
           },
         };
-        saveToStorage('lineStats', updated);
+        saveToStorage('subway-quiz-stats', updated);
         return updated;
       });
     }
@@ -934,7 +970,7 @@ export default function SubwayQuiz() {
       setLineStats(prev => {
         const line = prev[selectedLine] || { total: 0, freeCorrect: 0, mcCorrect: 0, transferAttempts: 0, transferCorrect: 0 };
         const updated = { ...prev, [selectedLine]: { ...line, mcCorrect: line.mcCorrect + 1 } };
-        saveToStorage('lineStats', updated);
+        saveToStorage('subway-quiz-stats', updated);
         return updated;
       });
     }
@@ -953,7 +989,7 @@ export default function SubwayQuiz() {
           transferCorrect: transferResult === 'correct' ? line.transferCorrect + 1 : line.transferCorrect,
         },
       };
-      saveToStorage('lineStats', updated);
+      saveToStorage('subway-quiz-stats', updated);
       return updated;
     });
   }, [transferPhase, transferResult, selectedLine]);
@@ -1125,9 +1161,22 @@ export default function SubwayQuiz() {
               </div>
             </div>
 
+            {/* Best record */}
+            {bestRecord.bestScore > 0 && (
+              <div className="text-center fade-up">
+                <div className="inline-block px-4 py-2 rounded-xl bg-gray-800/80 border border-gray-700">
+                  <span className="text-gray-400 text-sm">이전 최고: </span>
+                  <span className="text-yellow-400 font-black text-lg">{bestRecord.bestScore}점</span>
+                  <span className="text-gray-500 text-xs ml-2">
+                    {DIFFICULTY_LEVELS[bestRecord.bestLevel - 1]?.icon} Lv.{bestRecord.bestLevel}
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* Start button */}
             <button
-              onClick={async () => { await initTone(); dispatch({ type: 'START_GAME' }); }}
+              onClick={async () => { await initTone(); setIsNewRecord(false); dispatch({ type: 'START_GAME' }); }}
               className="w-full p-5 rounded-2xl text-2xl font-black
                 bg-gradient-to-r from-blue-600 to-purple-600
                 hover:brightness-110 active:scale-95 transition-all shadow-xl
@@ -1154,6 +1203,23 @@ export default function SubwayQuiz() {
             <p className="text-gray-500 text-sm text-center leading-relaxed">
               지하철 노선의 다음 역을 맞혀보세요!<br/>환승역에서는 보너스 찬스!
             </p>
+
+            <button
+              onClick={() => {
+                if (confirm('모든 기록(리더보드, 통계, 최고기록)을 초기화하시겠습니까?')) {
+                  setLeaderboard([]);
+                  saveToStorage('subway-quiz-leaderboard', []);
+                  setLineStats(makeEmptyLineStats());
+                  saveToStorage('subway-quiz-stats', makeEmptyLineStats());
+                  setBestRecord({ bestScore: 0, bestCombo: 0, bestLevel: 0 });
+                  saveToStorage('subway-quiz-best', { bestScore: 0, bestCombo: 0, bestLevel: 0 });
+                }
+              }}
+              className="w-full p-2.5 rounded-xl text-xs font-bold text-gray-500 bg-gray-800/50
+                hover:bg-red-900/30 hover:text-red-400 transition-all active:scale-95"
+            >
+              🗑 기록 초기화
+            </button>
           </div>
         </div>
       )}
@@ -1520,10 +1586,22 @@ export default function SubwayQuiz() {
                 {/* Multiple Choice (for wrong & timeout) */}
                 {(resultType === 'wrong' || resultType === 'timeout') && showMC && (
                   <div className="w-full fade-up">
+                    {/* Red bg flash per second during MC countdown */}
+                    {!mcResult && timeLeft <= 5 && timeLeft > 0 && (
+                      <div key={`mcfl-${Math.ceil(timeLeft)}`}
+                        className="fixed inset-0 pointer-events-none z-40"
+                        style={{ animation: 'flashRed 0.3s ease-out forwards' }} />
+                    )}
                     <p className="text-lg text-gray-300 mb-2">
                       {currentStation}에서 {getDirectionLabel(direction)} 방향
                     </p>
-                    <p className="text-xl font-bold mb-5">다음 역을 골라주세요!</p>
+                    <p className="text-xl font-bold mb-3">다음 역을 골라주세요!</p>
+                    {/* MC Timer */}
+                    {!mcResult && (
+                      <div className="flex justify-center mb-4">
+                        <TimerCircle tl={timeLeft} maxT={difficulty.inputTime / 2} size="w-20 h-20" />
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-3">
                       {mcOptions.map(opt => {
                         const isCorrectOpt = normalizeStation(opt) === normalizeStation(correctAnswer);
@@ -1546,9 +1624,15 @@ export default function SubwayQuiz() {
                     {mcResult === 'correct' && (
                       <div className="mt-4 text-green-400 text-xl font-bold pop-in">정답! +30점</div>
                     )}
-                    {mcResult === 'wrong' && (
+                    {mcResult === 'wrong' && mcSelectedOption !== null && (
                       <div className="mt-4 text-red-400 text-lg font-bold pop-in">
                         정답은 <span className="text-green-400 text-xl">{correctAnswer}</span>
+                      </div>
+                    )}
+                    {mcResult === 'wrong' && mcSelectedOption === null && (
+                      <div className="mt-4 pop-in">
+                        <div className="text-red-400 text-lg font-bold mb-1">시간 초과!</div>
+                        <div className="text-gray-300">정답은 <span className="text-green-400 text-xl font-bold">{correctAnswer}</span></div>
                       </div>
                     )}
                   </div>
@@ -1605,7 +1689,13 @@ export default function SubwayQuiz() {
         <div className="min-h-screen flex flex-col items-center justify-center px-4 text-center">
           <div className="text-6xl mb-3 pop-in">🏆</div>
           <h2 className="text-3xl font-black mb-1 fade-up">게임 완료!</h2>
-          <div className="text-sm text-gray-400 mb-6">{nickname}</div>
+          <div className="text-sm text-gray-400 mb-4">{nickname}</div>
+
+          {isNewRecord && (
+            <div className="text-2xl font-black text-yellow-300 mb-2 explode-anim">
+              🎉 신기록! 🎉
+            </div>
+          )}
 
           <div className="text-6xl font-black text-yellow-400 mb-8 count-up">
             {displayScore}점
@@ -1647,7 +1737,7 @@ export default function SubwayQuiz() {
               🏠 홈으로
             </button>
             <button
-              onClick={async () => { await initTone(); dispatch({ type: 'REPLAY' }); }}
+              onClick={async () => { await initTone(); setIsNewRecord(false); dispatch({ type: 'REPLAY' }); }}
               className="flex-1 p-4 rounded-xl text-lg font-bold bg-blue-600 hover:brightness-110 transition-all active:scale-95">
               🔄 다시 하기
             </button>
@@ -1684,13 +1774,15 @@ export default function SubwayQuiz() {
                 <div className="flex items-center text-xs text-gray-500 px-3 py-1">
                   <span className="w-8">#</span>
                   <span className="flex-1">닉네임</span>
-                  <span className="w-16 text-right">점수</span>
-                  <span className="w-14 text-right">정답률</span>
-                  <span className="w-20 text-right">날짜</span>
+                  <span className="w-14 text-right">점수</span>
+                  <span className="w-10 text-right">Lv</span>
+                  <span className="w-12 text-right">콤보</span>
+                  <span className="w-12 text-right">정답률</span>
                 </div>
                 {leaderboard.map((r, i) => {
                   const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`;
                   const isMe = i === currentRecordIdx;
+                  const lvl = r.level ? DIFFICULTY_LEVELS[r.level - 1] : null;
                   return (
                     <div key={i}
                       className={`flex items-center px-3 py-2.5 rounded-xl text-sm transition-all
@@ -1700,9 +1792,10 @@ export default function SubwayQuiz() {
                         {r.nickname}
                         {isMe && <span className="text-yellow-400 text-xs ml-1">← YOU</span>}
                       </span>
-                      <span className="w-16 text-right font-bold text-yellow-400">{r.score}</span>
-                      <span className="w-14 text-right text-gray-400">{r.accuracy}%</span>
-                      <span className="w-20 text-right text-gray-500 text-xs">{r.date}</span>
+                      <span className="w-14 text-right font-bold text-yellow-400">{r.score}</span>
+                      <span className="w-10 text-right text-gray-400">{lvl ? lvl.icon : '-'}</span>
+                      <span className="w-12 text-right text-orange-400">{r.maxCombo ? `🔥${r.maxCombo}` : '-'}</span>
+                      <span className="w-12 text-right text-gray-400">{r.accuracy}%</span>
                     </div>
                   );
                 })}
@@ -1713,7 +1806,7 @@ export default function SubwayQuiz() {
                 onClick={() => {
                   if (confirm('리더보드를 초기화하시겠습니까?')) {
                     setLeaderboard([]);
-                    saveToStorage('leaderboard', []);
+                    saveToStorage('subway-quiz-leaderboard', []);
                   }
                 }}
                 className="flex-1 p-3 rounded-xl text-sm font-bold bg-red-900/40 text-red-400
@@ -1833,7 +1926,7 @@ export default function SubwayQuiz() {
                     if (confirm('통계를 초기화하시겠습니까?')) {
                       const empty = makeEmptyLineStats();
                       setLineStats(empty);
-                      saveToStorage('lineStats', empty);
+                      saveToStorage('subway-quiz-stats', empty);
                     }
                   }}
                   className="flex-1 p-3 rounded-xl text-sm font-bold bg-red-900/40 text-red-400
