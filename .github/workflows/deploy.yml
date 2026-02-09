@@ -4,14 +4,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # 모든 실행 명령의 기본 위치를 app 폴더로 설정합니다.
     defaults:
       run:
         working-directory: ./app
@@ -25,7 +27,6 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
-          # app 폴더 안의 package-lock.json을 기준으로 캐시를 잡습니다.
           cache-dependency-path: './app/package-lock.json'
 
       - name: Install dependencies
@@ -34,9 +35,14 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Deploy
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          # 빌드 결과물(dist)의 위치도 app 폴더 기준으로 지정합니다.
-          publish_dir: ./app/dist
+          path: './app/dist'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
